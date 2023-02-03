@@ -14,7 +14,7 @@ class LinearTopKGate(torch.nn.Module):
         self.fp32_gate = fp32_gate
 
         for opt in options:
-            if opt not in ('capacity_factor', 'gate_noise'):
+            if opt not in ('capacity_factor', 'gate_noise', 'fixed_capacity'):
                 raise Exception('Unrecognized argument provided to Gating module: %s' % opt)
 
     def forward(self, x):

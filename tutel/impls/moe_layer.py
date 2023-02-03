@@ -79,6 +79,7 @@ class MOELayer(torch.nn.Module):
         is_gshard_loss=True,
         parallel_type='auto',
         use_2dh=False,
+        out_logits=False,
         **kwargs
     ):
         super().__init__()
@@ -136,6 +137,7 @@ class MOELayer(torch.nn.Module):
 
         self.a2a_ffn_overlap_degree = a2a_ffn_overlap_degree
         self.use_2dh = use_2dh
+        self.out_logits = out_logits
 
         if seeds is not None and seeds[1] is not None:
             torch.manual_seed(seeds[1])
@@ -250,23 +252,24 @@ class MOELayer(torch.nn.Module):
                 _loss_fn = lambda gates, topk_ids: losses.load_importance_loss(
                     F.softmax(logits, dim=1), logits_w_noise.gather(index=topk_ids, dim=1),
                     self.num_global_experts, gctx.gate_noise)
-            return logits.dtype, extract_critical(scores,
+            return logits.dtype, logits, extract_critical(scores,
                 top_k = gctx.top_k if top_k is None else top_k,
                 loss_fn = _loss_fn,
                 capacity_factor = gctx.capacity_factor if capacity_factor is None else capacity_factor,
+                fixed_capacity = gctx.fixed_capacity,
                 batch_prioritized_routing = self.batch_prioritized_routing,
                 normalize_gate = self.normalize_gate,
                 group = self.group,
                 alignment = self.sharded_count * a2a_ffn_overlap_degree,
                 inequivalent_tokens = inequivalent_tokens,
-            )
+            ), scores
 
 
         if x.is_cuda:
             with torch.cuda.amp.autocast(enabled=False):
-                logits_dtype, (crit, l_aux) = routing()
+                logits_dtype, logits, (crit, l_aux), scores = routing()
         else:
-            logits_dtype, (crit, l_aux) = routing()
+            logits_dtype, logits, (crit, l_aux), scores = routing()
 
         y = fast_encode(x.to(logits_dtype), crit, self.is_postscore).to(x.dtype)
 
@@ -299,8 +302,17 @@ class MOELayer(torch.nn.Module):
 
         y = fast_decode(y.to(logits_dtype), crit, self.is_postscore)
 
+        locations_s, expert_capacity = crit[2], crit[4]
+        droped_tokens_mask = locations_s[0] >= expert_capacity
+        droped_tokens_mask = droped_tokens_mask.bool()
+        router_prob = torch.max(scores, dim=-1).values.unsqueeze(-1)
+        y[droped_tokens_mask] = router_prob[droped_tokens_mask] * x[droped_tokens_mask]
+
         y = y.view(list(original_shape[:-reserve_dims]) + list(self.protected_shape[-reserve_dims:])).to(original_dtype)
         self.l_aux = y.l_aux = l_aux
-        return self.result_func(y) if self.result_func is not None else y
+        if self.out_logits:
+            return (self.result_func(y), logits) if (self.result_func is not None) else (y, logits)
+        else:
+            return self.result_func(y) if self.result_func is not None else y
 
 moe_layer = MOELayer

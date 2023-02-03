@@ -137,7 +137,7 @@ def compute_sorted_location(x, importance_scores):
     sorted_cumsum = fast_cumsum_sub_one(sorted_x) * sorted_x
     return sorted_cumsum[importance_scores.argsort(dim=0).argsort(dim=0)]
 
-def extract_critical(scores, top_k, loss_fn=losses.gshard_loss, capacity_factor=1.0, batch_prioritized_routing=False, normalize_gate=True, alignment=1, group=None, inequivalent_tokens=False):
+def extract_critical(scores, top_k, loss_fn=losses.gshard_loss, capacity_factor=1.0, fixed_capacity = None, batch_prioritized_routing=False, normalize_gate=True, alignment=1, group=None, inequivalent_tokens=False):
     num_global_experts = int(scores.size(1))
     top_k, top_k_original = min(top_k, num_global_experts), top_k
     topk_indices = torch.topk(scores, top_k, dim=1).indices
@@ -179,21 +179,23 @@ def extract_critical(scores, top_k, loss_fn=losses.gshard_loss, capacity_factor=
     else:
         num_samples = int(scores.size(0))
 
-    samples_per_expert = (num_samples + num_global_experts - 1) // num_global_experts
-    if capacity_factor > 0:
-        capacity = top_k * int(capacity_factor * samples_per_expert)
+    if fixed_capacity == None:
+        samples_per_expert = (num_samples + num_global_experts - 1) // num_global_experts
+        if capacity_factor > 0:
+            capacity = top_k * int(capacity_factor * samples_per_expert)
+        else:
+            capacity = torch.max(torch.cat(locations_s, dim=0))
+            capacity = int(simple_all_reduce(capacity, group=group, op=torch.distributed.ReduceOp.MAX)) + 1
+            if capacity_factor < 0:
+                capacity = min(capacity, top_k * int(-capacity_factor * samples_per_expert))
+        remainder = capacity % alignment
+        if remainder > 0:
+            capacity = capacity + alignment - remainder
+
+        if get_world_rank(group) == 0:
+            logging.info(f"Capacity = {capacity}, real-time capacity-factor for top-{top_k_original} = {capacity / (top_k * samples_per_expert)}")
     else:
-        capacity = torch.max(torch.cat(locations_s, dim=0))
-        capacity = int(simple_all_reduce(capacity, group=group, op=torch.distributed.ReduceOp.MAX)) + 1
-        if capacity_factor < 0:
-            capacity = min(capacity, top_k * int(-capacity_factor * samples_per_expert))
-
-    remainder = capacity % alignment
-    if remainder > 0:
-        capacity = capacity + alignment - remainder
-
-    if get_world_rank(group) == 0:
-        logging.info(f"Capacity = {capacity}, real-time capacity-factor for top-{top_k_original} = {capacity / (top_k * samples_per_expert)}")
+        capacity = fixed_capacity
 
     return (num_global_experts, indices_s, locations_s, gates_s, capacity), l_loss
 
